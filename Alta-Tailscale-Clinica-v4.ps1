@@ -10,7 +10,7 @@
 
     Uso (PowerShell como Administrador):
         .\Alta-Tailscale-Clinica.ps1
-            -> pregunta el nombre del equipo y la auth key
+            -> pregunta el nombre del equipo, el ApiToken (opcional) y la auth key
 
         .\Alta-Tailscale-Clinica.ps1 -Hostname "clinica-dd-00179" -AuthKey "tskey-auth-xxxxx"
             -> sin preguntas, para desatendido total
@@ -74,7 +74,16 @@ Log "Nombre a usar: $Hostname"
 
 # ------------------------------------------------- 2. Comprobar duplicados
 if ([string]::IsNullOrWhiteSpace($ApiToken)) {
-    Log "AVISO: sin -ApiToken no compruebo si '$Hostname' ya existe."
+    Write-Host ""
+    Write-Host "  Token de API de Tailscale (solo lectura) para comprobar si '$Hostname' ya existe." -ForegroundColor DarkGray
+    Write-Host "  Dejalo en blanco y pulsa Enter para saltarte esta comprobacion." -ForegroundColor DarkGray
+    $secureApi = Read-Host -Prompt "Pega el ApiToken (opcional)" -AsSecureString
+    $ApiToken  = [Runtime.InteropServices.Marshal]::PtrToStringAuto(
+                     [Runtime.InteropServices.Marshal]::SecureStringToBSTR($secureApi))
+}
+
+if ([string]::IsNullOrWhiteSpace($ApiToken)) {
+    Log "AVISO: sin ApiToken no compruebo si '$Hostname' ya existe."
     if ((Read-Host "Continuar? (s/N)") -notmatch '^[sS]') { Log "Cancelado."; return }
 }
 else {
@@ -127,9 +136,16 @@ else {
         Log "Consultando la ultima version estable..."
         try {
             $indice = Invoke-WebRequest -Uri "https://pkgs.tailscale.com/stable/" -UseBasicParsing
-            $encontradas = [regex]::Matches(
-                $indice.Content, "tailscale-setup-(\d+\.\d+\.\d+)-$arch\.msi"
-            ) | ForEach-Object { $_.Groups[1].Value } | Sort-Object { [version]$_ } -Unique
+            # @(...) fuerza array: si solo hay UNA coincidencia, PowerShell
+            # devuelve un string suelto en vez de un array de 1 elemento, y
+            # $encontradas[-1] cogeria el ULTIMO CARACTER del string (p.ej.
+            # "4" de "1.102.4") en lugar del ultimo elemento. Con @() esto
+            # no puede pasar, tenga 1 o N coincidencias.
+            $encontradas = @(
+                [regex]::Matches($indice.Content, "tailscale-setup-(\d+\.\d+\.\d+)-$arch\.msi") |
+                    ForEach-Object { $_.Groups[1].Value } |
+                    Sort-Object { [version]$_ } -Unique
+            )
             if (-not $encontradas) { throw "No hay MSI para '$arch' en el indice." }
             $Version = $encontradas[-1]
         }
@@ -137,6 +153,15 @@ else {
             throw "No he podido determinar la version ($($_.Exception.Message)). Usa -Version o -MsiPath."
         }
     }
+
+    # Validacion de formato: si $Version viene mal (parametro a mano con
+    # un valor invalido, o un parseo del indice que devuelve algo raro),
+    # cortamos aqui con un mensaje claro en vez de intentar descargar
+    # una URL que seguro no existe (p.ej. "tailscale-setup-4-amd64.msi").
+    if ($Version -notmatch '^\d+\.\d+\.\d+$') {
+        throw "Version '$Version' no tiene formato X.Y.Z valido. Revisa -Version o el parseo del indice."
+    }
+
     Log "Version a instalar: $Version"
 
     $msiUrl  = "https://pkgs.tailscale.com/stable/tailscale-setup-$Version-$arch.msi"
@@ -149,7 +174,7 @@ else {
         Log "Descargando $msiUrl ..."
         $progressPreference = 'SilentlyContinue'
         try   { Invoke-WebRequest -Uri $msiUrl -OutFile $MsiPath -UseBasicParsing }
-        catch { throw "Fallo la descarga: $($_.Exception.Message)" }
+        catch { throw "Fallo la descarga de '$msiUrl': $($_.Exception.Message)" }
         $progressPreference = 'Continue'
         $descargado = $true
     }
@@ -170,6 +195,20 @@ if (-not $SoloInstalar -and [string]::IsNullOrWhiteSpace($AuthKey)) {
     $secure  = Read-Host -Prompt "Pega la auth key" -AsSecureString
     $AuthKey = [Runtime.InteropServices.Marshal]::PtrToStringAuto(
                    [Runtime.InteropServices.Marshal]::SecureStringToBSTR($secure))
+}
+
+if (-not $SoloInstalar) {
+    # Recorta espacios/saltos de linea que a veces cuela el portapapeles
+    $AuthKey = $AuthKey.Trim()
+
+    # Comprobacion basica de formato/longitud: si la key se copio a medias
+    # (p.ej. doble clic en el navegador, que corta la seleccion en los
+    # guiones) mejor avisar aqui con un mensaje claro que dejar que
+    # 'tailscale up' falle con un backend error opaco.
+    if ($AuthKey -notmatch '^tskey-auth-' -or $AuthKey.Length -lt 40) {
+        throw "La AuthKey no tiene pinta valida (deberia empezar por 'tskey-auth-' y ser bastante mas larga). " +
+              "Revisa que la copiaste completa desde la consola de Tailscale, sin usar doble clic."
+    }
 }
 
 # ------------------------------------------------- 5. Instalacion silenciosa
